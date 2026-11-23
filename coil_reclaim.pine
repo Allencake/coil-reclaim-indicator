@@ -1,0 +1,206 @@
+//@version=5
+// 回踩确认
+// 大周期均线定方向，带宽压缩出区间，放量突破后再等回踩确认。
+// 与「昨收/4小时 K 线颜色定方向、只做各交易时段首小时」不是同一套逻辑。
+// 图中任何价位、止损和目标倍数都只是参数与标记，不构成收益承诺。
+
+indicator("回踩确认", shorttitle="回踩确认", overlay=true, max_labels_count=100, max_boxes_count=60, max_lines_count=60)
+
+// ——— 参数 ———
+grpHTF  = "大周期方向"
+grpCoil = "压缩与突破"
+grpEntr = "回踩进场"
+grpVis  = "显示"
+
+htf         = input.timeframe("60", "大周期", group=grpHTF)
+emaLen      = input.int(55, "大周期均线长度", minval=2, group=grpHTF)
+bbLen       = input.int(20, "布林长度", minval=2, group=grpCoil)
+bbMult      = input.float(2.0, "布林倍数", step=0.1, group=grpCoil)
+coilLook    = input.int(100, "压缩回看根数", minval=20, group=grpCoil)
+coilPct     = input.float(20.0, "压缩分位（带宽低于该百分比视为压缩）", minval=5.0, maxval=50.0, step=0.5, group=grpCoil)
+volLen      = input.int(20, "成交量均线", minval=2, group=grpCoil)
+volMult     = input.float(1.0, "放量倍数", minval=0.1, step=0.1, group=grpCoil)
+rsiLen      = input.int(14, "RSI 长度", minval=2, group=grpEntr)
+rsiLongMax  = input.int(70, "多头 RSI 上限（高于则不做多）", minval=50, maxval=90, group=grpEntr)
+rsiShortMin = input.int(30, "空头 RSI 下限（低于则不做空）", minval=10, maxval=50, group=grpEntr)
+t1R         = input.float(1.5, "第一目标（风险倍数，仅作标记示例）", minval=0.5, step=0.1, group=grpEntr)
+maxWait     = input.int(20, "突破后最多等待根数", minval=3, group=grpEntr)
+showBB      = input.bool(true, "显示布林带", group=grpVis)
+showTable   = input.bool(true, "显示状态表", group=grpVis)
+showMarks   = input.bool(true, "显示进出场标记", group=grpVis)
+
+// ——— 大周期方向：收盘在 EMA 上方只做多，下方只做空 ———
+htfClose = request.security(syminfo.tickerid, htf, close, barmerge.gaps_off, barmerge.lookahead_off)
+htfEma   = request.security(syminfo.tickerid, htf, ta.ema(close, emaLen), barmerge.gaps_off, barmerge.lookahead_off)
+biasLong  = not na(htfClose) and not na(htfEma) and htfClose > htfEma
+biasShort = not na(htfClose) and not na(htfEma) and htfClose < htfEma
+
+// ——— 布林带宽，用百分位判断是否处于压缩 ———
+basis = ta.sma(close, bbLen)
+dev   = bbMult * ta.stdev(close, bbLen)
+upper = basis + dev
+lower = basis - dev
+bw    = basis != 0 ? (upper - lower) / basis * 100.0 : na
+bwRank = ta.percentrank(bw, coilLook)
+inCoil = not na(bwRank) and bwRank <= coilPct
+
+volAvg = ta.sma(volume, volLen)
+volOk  = not na(volAvg) and volume > volMult * volAvg
+rsi    = ta.rsi(close, rsiLen)
+
+// 状态：0 空闲，1 压缩中，2 已突破等回踩，3 已标记进场（看到止损或目标后回到 0）
+var int   st        = 0
+var float coilHi    = na
+var float coilLo    = na
+var int   coilStart = na
+var int   coilEnd   = na
+var float brkLvl    = na
+var bool  brkIsLong = false
+var int   brkBar    = na
+var float entryPx   = na
+var float stopPx    = na
+var float t1Px      = na
+var box   coilBox   = na
+var line  brkLine   = na
+
+f_reset() =>
+    st        := 0
+    coilHi    := na
+    coilLo    := na
+    coilStart := na
+    coilEnd   := na
+    brkLvl    := na
+    brkIsLong := false
+    brkBar    := na
+    entryPx   := na
+    stopPx    := na
+    t1Px      := na
+
+// 开启或延续压缩区间
+if st == 0 and inCoil
+    st        := 1
+    coilHi    := high
+    coilLo    := low
+    coilStart := bar_index
+    coilEnd   := bar_index
+else if st == 1 and inCoil
+    coilHi    := math.max(coilHi, high)
+    coilLo    := math.min(coilLo, low)
+    coilEnd   := bar_index
+else if st == 1 and not inCoil
+    coilEnd := bar_index
+    // 压缩刚结束，高低点冻结，仍停留在状态 1，等待放量收盘突破
+
+// 放量收盘突破压缩区间，且方向与大周期一致
+relLong  = st == 1 and not na(coilHi) and close > coilHi and biasLong  and volOk
+relShort = st == 1 and not na(coilLo) and close < coilLo and biasShort and volOk
+
+if relLong
+    st        := 2
+    brkLvl    := coilHi
+    brkIsLong := true
+    brkBar    := bar_index
+    if showMarks
+        label.new(bar_index, low, "突破", style=label.style_label_up, color=color.new(#089981, 0), textcolor=color.white, size=size.small)
+if relShort
+    st        := 2
+    brkLvl    := coilLo
+    brkIsLong := false
+    brkBar    := bar_index
+    if showMarks
+        label.new(bar_index, high, "突破", style=label.style_label_down, color=color.new(#f23645, 0), textcolor=color.white, size=size.small)
+
+// 回踩确认：触及突破位后，收盘重新站回方向一侧，并满足 RSI 过滤
+waitExpired = st == 2 and not na(brkBar) and (bar_index - brkBar) > maxWait
+recLong  = st == 2 and brkIsLong and not na(brkLvl) and low <= brkLvl and close > brkLvl and (na(rsi) or rsi < rsiLongMax)
+recShort = st == 2 and not brkIsLong and not na(brkLvl) and high >= brkLvl and close < brkLvl and (na(rsi) or rsi > rsiShortMin)
+
+if recLong
+    entryPx := close
+    stopPx  := math.min(coilLo, low)
+    t1Px    := entryPx + t1R * (entryPx - stopPx)
+    st      := 3
+    if showMarks
+        label.new(bar_index, low, "回踩确认", style=label.style_label_up, color=color.new(#2962ff, 0), textcolor=color.white, size=size.small)
+        line.new(bar_index, stopPx, bar_index + 8, stopPx, color=#f23645, style=line.style_dotted, width=1)
+        line.new(bar_index, t1Px,   bar_index + 8, t1Px,   color=#089981, style=line.style_dotted, width=1)
+if recShort
+    entryPx := close
+    stopPx  := math.max(coilHi, high)
+    t1Px    := entryPx - t1R * (stopPx - entryPx)
+    st      := 3
+    if showMarks
+        label.new(bar_index, high, "回踩确认", style=label.style_label_down, color=color.new(#2962ff, 0), textcolor=color.white, size=size.small)
+        line.new(bar_index, stopPx, bar_index + 8, stopPx, color=#f23645, style=line.style_dotted, width=1)
+        line.new(bar_index, t1Px,   bar_index + 8, t1Px,   color=#089981, style=line.style_dotted, width=1)
+
+if waitExpired
+    if showMarks
+        label.new(bar_index, high, "回踩超时", style=label.style_label_down, color=color.new(#787b86, 20), textcolor=color.white, size=size.tiny)
+    f_reset()
+
+// 进场标记后，价格碰到止损或第一目标，状态清零，重新等待下一轮压缩
+if st == 3 and not na(stopPx) and not na(t1Px)
+    hit = brkIsLong ? (low <= stopPx or high >= t1Px) : (high >= stopPx or low <= t1Px)
+    if hit
+        f_reset()
+
+// 压缩还未突破时，若方向反了且带宽重新扩张很久，避免死扛旧区间
+if st == 1 and not inCoil and not na(coilEnd) and (bar_index - coilEnd) > maxWait * 2
+    f_reset()
+
+// ——— 绘图 ———
+plot(showBB ? upper : na, "布林上轨", color=color.new(#2962ff, 40), linewidth=1)
+plot(showBB ? basis : na, "布林中轨", color=color.new(#787b86, 30), linewidth=1)
+plot(showBB ? lower : na, "布林下轨", color=color.new(#2962ff, 40), linewidth=1)
+fill(plot(showBB ? upper : na, display=display.none), plot(showBB ? lower : na, display=display.none), color=color.new(#2962ff, 88), title="布林填充")
+
+// 压缩区间框：只在压缩进行中或等待回踩时画当前这一段
+if barstate.islast and showMarks and not na(coilHi) and not na(coilLo) and not na(coilStart) and st >= 1
+    if not na(coilBox)
+        box.delete(coilBox)
+    coilBox := box.new(coilStart, coilHi, bar_index, coilLo, border_color=color.new(#ff9800, 0), border_width=1, bgcolor=color.new(#ff9800, 88), extend=extend.none)
+    if not na(brkLine)
+        line.delete(brkLine)
+    if st >= 2 and not na(brkLvl)
+        brkLine := line.new(coilStart, brkLvl, bar_index + 3, brkLvl, color=color.new(#ff9800, 0), style=line.style_dashed, width=1)
+
+plotshape(relLong,  title="多头突破", style=shape.triangleup,   location=location.belowbar, color=#089981, size=size.tiny)
+plotshape(relShort, title="空头突破", style=shape.triangledown, location=location.abovebar, color=#f23645, size=size.tiny)
+plotshape(recLong,  title="多头回踩", style=shape.circle,       location=location.belowbar, color=#2962ff, size=size.tiny)
+plotshape(recShort, title="空头回踩", style=shape.circle,       location=location.abovebar, color=#2962ff, size=size.tiny)
+
+// ——— 状态表（不含胜率、盈亏、盈亏比） ———
+var table hud = table.new(position.top_right, 2, 16, bgcolor=color.new(#0f1724, 8), border_color=color.new(#26a69a, 50), border_width=1, frame_color=color.new(#26a69a, 50), frame_width=1)
+
+cell(int r, string l, string v, color vc) =>
+    table.cell(hud, 0, r, l, text_color=color.new(#9aa0b0, 0), text_halign=text.align_left,  bgcolor=color.new(#0f1724, 0), text_size=size.small)
+    table.cell(hud, 1, r, v, text_color=vc,                   text_halign=text.align_right, bgcolor=color.new(#0f1724, 0), text_size=size.small)
+
+if showTable and barstate.islast
+    stTxt = st == 0 ? "等待压缩" : st == 1 ? (inCoil ? "压缩进行中" : "压缩结束，等突破") : st == 2 ? "等待回踩" : "已标记进场"
+    biasTxt = biasLong ? "只做多" : biasShort ? "只做空" : "无方向"
+    biasCol = biasLong ? #089981 : biasShort ? #f23645 : #787b86
+    table.cell(hud, 0, 0, "回踩确认", text_color=color.white, bgcolor=color.new(#0b1220, 0), text_halign=text.align_left, text_size=size.normal)
+    table.cell(hud, 1, 0, "示例",     text_color=color.new(#ffb74d, 0), bgcolor=color.new(#0b1220, 0), text_halign=text.align_right, text_size=size.small)
+    cell(1,  "品种",     syminfo.ticker, color.white)
+    cell(2,  "图表周期", timeframe.period, color.white)
+    cell(3,  "大周期",   htf + "  EMA" + str.tostring(emaLen), color.white)
+    cell(4,  "均线方向", biasTxt, biasCol)
+    cell(5,  "带宽分位", na(bwRank) ? "—" : str.tostring(bwRank, "#.0") + "%", inCoil ? #ff9800 : color.white)
+    cell(6,  "压缩上沿", na(coilHi) ? "—" : str.tostring(coilHi, format.mintick), color.white)
+    cell(7,  "压缩下沿", na(coilLo) ? "—" : str.tostring(coilLo, format.mintick), color.white)
+    cell(8,  "突破位",   na(brkLvl) ? "—" : str.tostring(brkLvl, format.mintick), color.white)
+    cell(9,  "放量",     volOk ? "是" : "否", volOk ? #089981 : #787b86)
+    cell(10, "RSI",      na(rsi) ? "—" : str.tostring(rsi, "#.0"), color.white)
+    cell(11, "状态",     stTxt, color.white)
+    cell(12, "止损标记", na(stopPx) ? "—" : str.tostring(stopPx, format.mintick), #f23645)
+    cell(13, "目标标记", na(t1Px) ? "—" : str.tostring(t1Px, format.mintick) + "（" + str.tostring(t1R, "#.0") + "R，示例）", #089981)
+    cell(14, "下一步",   st == 0 ? "等带宽再次收缩" : st == 1 ? "等放量收盘突破" : st == 2 ? "等回踩站回突破位" : "按标记管理，不追价", color.new(#cfd2db, 0))
+    table.merge_cells(hud, 0, 15, 1, 15)
+    table.cell(hud, 0, 15, "价位与目标均为示例，不构成建议", text_color=color.new(#787b86, 0), bgcolor=color.new(#0b1220, 0), text_halign=text.align_left, text_size=size.tiny)
+
+alertcondition(recLong,  title="多头回踩确认", message="回踩确认：多头条件满足，请核对手动下单，本信号不是收益承诺。")
+alertcondition(recShort, title="空头回踩确认", message="回踩确认：空头条件满足，请核对手动下单，本信号不是收益承诺。")
+alertcondition(relLong,  title="多头压缩突破", message="压缩区间被向上放量突破，等待回踩，不要追价。")
+alertcondition(relShort, title="空头压缩突破", message="压缩区间被向下放量突破，等待回踩，不要追价。")
